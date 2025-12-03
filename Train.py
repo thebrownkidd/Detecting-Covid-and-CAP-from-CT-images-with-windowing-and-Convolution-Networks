@@ -53,10 +53,9 @@ def npy_loader(path):
         vol = np.clip(vol, 0.0, 1.0)
     return vol
 
-def generator_from_df(df, label_map, augment=False):
+def generator_from_df(df, label_map):
     """
-    Yields (vol, label_idx).
-    df must contain column 'npy_path' and 'label'
+    Yields (vol, label_idx) with NO augmentation.
     """
     for _, row in df.iterrows():
         try:
@@ -65,53 +64,35 @@ def generator_from_df(df, label_map, augment=False):
             print(f"[WARN] failed loading {row['npy_path']}: {e}")
             continue
 
-        # basic sanity: ensure channel last 4D
-        if vol.ndim == 3:
+        if vol.ndim == 3:  # safety
             vol = vol[..., None]
-
-        # light augmentation (in numpy)
-        if augment:
-            # flip LR
-            if random.random() < 0.5:
-                vol = np.flip(vol, axis=2)
-            # flip UD
-            if random.random() < 0.3:
-                vol = np.flip(vol, axis=1)
-            # rotate 90 deg occasionally
-            if random.random() < 0.2:
-                k = random.randint(1,3)
-                vol = np.rot90(vol, k=k, axes=(1,2))
 
         yield vol, np.int32(label_map[row['label']])
 
 
-def build_tf_dataset(df, label_map, batch, augment=False, shuffle=False):
-    gen = lambda: generator_from_df(df, label_map, augment=augment)
-    # infer shape from first sample
+def build_tf_dataset(df, label_map, batch):
+    gen = lambda: generator_from_df(df, label_map)
+
+    # Get sample shape
     for _, r in df.iterrows():
-        try:
-            sample = np.load(r['npy_path'])
-            break
-        except:
-            sample = None
-    if sample is None:
-        raise RuntimeError("No readable .npy found in dataframe.")
-    # shape handling
+        sample = np.load(r['npy_path'])
+        break
+
     if sample.ndim == 3:
         sample_shape = (sample.shape[0], sample.shape[1], sample.shape[2], 1)
     else:
-        sample_shape = (sample.shape[0], sample.shape[1], sample.shape[2], sample.shape[3])
+        sample_shape = sample.shape
 
     output_types = (tf.float32, tf.int32)
     output_shapes = (sample_shape, ())
 
     ds = tf.data.Dataset.from_generator(
-    gen,
-    output_types=output_types,
-    output_shapes=output_shapes
+        gen,
+        output_types=output_types,
+        output_shapes=output_shapes
     )
+
     ds = ds.batch(batch)
-    ds = ds.repeat()     # REQUIRED
     ds = ds.prefetch(AUTOTUNE)
     return ds
 
@@ -198,9 +179,9 @@ def main(args):
         print("Using class weights:", class_weights)
 
     # build tf datasets
-    train_ds = build_tf_dataset(train_df, label_map, batch=args.batch_size, augment=False, shuffle=False)
-    val_ds   = build_tf_dataset(val_df,   label_map, batch=args.batch_size, augment=False, shuffle=False)
-    test_ds  = build_tf_dataset(test_df,  label_map, batch=args.batch_size, augment=False, shuffle=False)
+    train_ds = build_tf_dataset(train_df, label_map, batch=args.batch_size)
+    val_ds   = build_tf_dataset(val_df,   label_map, batch=args.batch_size)
+    test_ds  = build_tf_dataset(test_df,  label_map, batch=args.batch_size)
 
     # infer input shape from dataset element
     for xb, yb in train_ds.take(1):
@@ -222,7 +203,7 @@ def main(args):
         ckpt_path, monitor='val_sparse_categorical_accuracy', save_best_only=True, mode='max', verbose=1
     )
     tb_cb = tf.keras.callbacks.TensorBoard(log_dir=os.path.join(args.out, "tensorboard"))
-    early = tf.keras.callbacks.EarlyStopping(monitor='val_sparse_categorical_accuracy', mode='max', patience=6, restore_best_weights=True)
+    early = tf.keras.callbacks.EarlyStopping(monitor='val_sparse_categorical_accuracy', mode='max', patience=30, restore_best_weights=True)
 
     steps_per_epoch = len(train_df) // args.batch_size
     val_steps = len(val_df) // args.batch_size
@@ -247,7 +228,10 @@ def main(args):
     # ---- Evaluate on test ----
     y_true = []
     y_prob = []
-    for xb, yb in tqdm(test_ds, desc="Predicting test"):
+    # print the length of the test dataset:
+    
+    print(test_ds.__len__())
+    for xb, yb in enumerate(test_ds):
         p = model.predict(xb)
         y_prob.extend(p.tolist())
         y_true.extend(yb.numpy().tolist())

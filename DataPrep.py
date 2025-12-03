@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-DataPrep_v3_2.py
+DataPrep_v3_3_multithread.py
 
-Final high-quality preprocessing pipeline for volumetric CT classification.
+Fast multithreaded preprocessing:
+ - Loads DICOM → HU
+ - Lung mask
+ - CT windows (raw, lung, soft, bone)
+ - 4-channel volume
+ - Cubic interpolation (3D)
+ - Saves .npy
+ - Writes single index CSV (no splits)
 
-Features:
- - Loads DICOM series → HU
- - Computes lung mask (background removal)
- - Applies 3 CT windows (lung, soft, bone)
- - Builds volume (Z,H,W,3)
- - Resamples using full 3D cubic interpolation (scipy.ndimage.zoom)
- - Saves uniform .npy volumes
- - Generates train/val/test splits (stratified by label)
- - Copies volumes into: train/, val/, test/ directories
-
-Usage:
-    python DataPrep_v3_2.py
+Uses ThreadPoolExecutor to max out your AMD CPU.
 """
 
 import os
@@ -23,18 +19,15 @@ import numpy as np
 import pandas as pd
 import SimpleITK as sitk
 from tqdm import tqdm
-from scipy.ndimage import zoom
-from scipy.ndimage import binary_fill_holes
-from skimage.morphology import closing, opening, disk, remove_small_objects
-from sklearn.model_selection import train_test_split
-import shutil
+from scipy.ndimage import zoom, binary_fill_holes
+from skimage.morphology import opening, closing, remove_small_objects, disk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============================================================
+# --------------------
 # CONFIG
-# ============================================================
-
+# --------------------
 DATA_ROOT = "Data"
-OUTPUT_ROOT = "preprocessed_v3_1"     # keep folder name
+OUTPUT_ROOT = "preprocessed_v3_1"
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
 LABEL_MAP = {
@@ -43,29 +36,23 @@ LABEL_MAP = {
     "cap": "cap"
 }
 
-# Target shape for cubic interpolation
 TARGET_Z = 48
 TARGET_H = 64
 TARGET_W = 64
 
-# Train/Val/Test ratio
-TRAIN_RATIO = 0.70
-VAL_RATIO   = 0.15
-TEST_RATIO  = 0.15
-RANDOM_SEED = 42
+MAX_WORKERS = min(os.cpu_count(), 8)  # Use up to 8 CPU threads
+print(f"[i] Using {MAX_WORKERS} threads for preprocessing.")
 
+# --------------------
+# Helper functions
+# --------------------
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def load_hu_volume(study_path):
-    """Load full DICOM series → HU array."""
+def load_hu(study_path):
+    """Load DICOM → HU"""
     reader = sitk.ImageSeriesReader()
     dcm_files = reader.GetGDCMSeriesFileNames(study_path)
-
-    if len(dcm_files) == 0:
-        raise RuntimeError(f"No DICOM files found in {study_path}")
+    if not dcm_files:
+        raise RuntimeError(f"No DICOM series in {study_path}")
 
     reader.SetFileNames(dcm_files)
     img = reader.Execute()
@@ -74,24 +61,21 @@ def load_hu_volume(study_path):
 
     slope = float(img.GetMetaData("0028|1053")) if img.HasMetaDataKey("0028|1053") else 1
     intercept = float(img.GetMetaData("0028|1052")) if img.HasMetaDataKey("0028|1052") else 0
-    arr = arr * slope + intercept
 
-    return arr
+    return arr * slope + intercept
 
 
-def apply_slicewise(volume, func):
-    out = np.zeros_like(volume)
-    for i in range(volume.shape[0]):
-        out[i] = func(volume[i])
+def slice_apply(vol, func):
+    out = np.zeros_like(vol)
+    for i in range(vol.shape[0]):
+        out[i] = func(vol[i])
     return out
 
 
-def get_lung_mask(hu):
-    """ Basic lung segmentation to remove ribs/heart/background. """
+def lung_mask(hu):
     mask = (hu < -400)
-
-    mask = apply_slicewise(mask, lambda x: opening(x, disk(3)))
-    mask = apply_slicewise(mask, lambda x: closing(x, disk(5)))
+    mask = slice_apply(mask, lambda x: opening(x, disk(3)))
+    mask = slice_apply(mask, lambda x: closing(x, disk(5)))
 
     cleaned = np.zeros_like(mask)
     for i in range(mask.shape[0]):
@@ -105,162 +89,101 @@ def get_lung_mask(hu):
 
 
 def window(hu, level, width):
-    lower = level - width//2
-    upper = level + width//2
-    w = np.clip(hu, lower, upper)
-    return (w - lower) / (upper - lower)
+    lo = level - width // 2
+    hi = level + width // 2
+    w = np.clip(hu, lo, hi)
+    return (w - lo) / (hi - lo)
 
 
-def resample_volume_3d(vol, target_z, target_h, target_w):
-    """3D cubic interpolation to fixed shape."""
+def resample_3d(vol):
+    """3D cubic interpolation to fixed shape"""
     Z, H, W, C = vol.shape
-
-    zoom_factors = (
-        target_z / Z,
-        target_h / H,
-        target_w / W
-    )
-
-    out = np.zeros((target_z, target_h, target_w, C), dtype=np.float32)
-
+    zoom_factors = (TARGET_Z / Z, TARGET_H / H, TARGET_W / W)
+    out = np.zeros((TARGET_Z, TARGET_H, TARGET_W, C), dtype=np.float32)
     for c in range(C):
         out[..., c] = zoom(vol[..., c], zoom_factors, order=3)
-
     return out
 
 
-# ============================================================
-# PIPELINE
-# ============================================================
+# --------------------
+# Worker function
+# --------------------
+
+def process_study(study_path, label, study_name):
+    """
+    Runs full preprocessing for ONE study.
+    Returns: (output_path, label, study_name)
+    """
+    try:
+        # Load HU
+        hu = load_hu(study_path)
+
+        # Lung segmentation
+        mask = lung_mask(hu)
+        hu = hu * mask
+
+        # Channels
+        raw = np.clip(hu, -1024, 400).astype(np.float32)
+        raw = (raw + 1024) / (400 + 1024)
+
+        lung_win = window(hu, -600, 1500)
+        soft_win = window(hu, 40, 400)
+        bone_win = window(hu, 300, 1500)
+
+        vol = np.stack([raw, lung_win, soft_win, bone_win], axis=-1)
+        vol = resample_3d(vol)
+
+        # Save
+        out_dir = os.path.join(OUTPUT_ROOT, label)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{study_name}.npy")
+
+        np.save(out_path, vol.astype(np.float32))
+        return out_path, label, study_name
+
+    except Exception as e:
+        return None, None, f"Error in {study_path}: {e}"
+
+
+# --------------------
+# Main loop
+# --------------------
 
 records = []
+tasks = []
 
-for folder in os.listdir(DATA_ROOT):
-    folder_path = os.path.join(DATA_ROOT, folder)
-    if not os.path.isdir(folder_path):
-        continue
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-    csv_path = os.path.join(DATA_ROOT, f"{folder.lower()}-labels.csv")
-    if not os.path.exists(csv_path):
-        print(f"[WARN] Missing CSV for {folder}")
-        continue
+    for folder in os.listdir(DATA_ROOT):
 
-    df = pd.read_csv(csv_path)
+        csv_path = os.path.join(DATA_ROOT, f"{folder.lower()}-labels.csv")
+        folder_path = os.path.join(DATA_ROOT, folder)
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Processing {folder}"):
-
-        study = row["Study"]
-        label = LABEL_MAP[row["Label"]]
-        study_path = os.path.join(DATA_ROOT, folder, study)
-
-        if not os.path.exists(study_path):
-            print(f"[WARN] Missing folder: {study_path}")
+        if not os.path.isdir(folder_path) or not os.path.exists(csv_path):
             continue
 
-        try:
-            # 1. Load volume
-            hu = load_hu_volume(study_path)
+        df = pd.read_csv(csv_path)
 
-            # 2. Lung mask
-            lung = get_lung_mask(hu)
-            hu = hu * lung
+        for _, row in df.iterrows():
+            study = row["Study"]
+            label = LABEL_MAP[row["Label"]]
+            study_path = os.path.join(folder_path, study)
 
-            # -------------------------
-            # 3. Create 4-channel volume
-            # -------------------------
+            tasks.append(
+                executor.submit(process_study, study_path, label, study)
+            )
 
-            # Channel 0: raw HU values inside lung
-            raw_hu = np.clip(hu, -1024, 400).astype(np.float32)
-            raw_hu = (raw_hu + 1024) / (400 + 1024)   # normalize to [0,1]
-
-            # Channel 1: lung window
-            lung_win = window(hu, -600, 1500)  # already 0..1
-
-            # Channel 2: soft-tissue window
-            soft_win = window(hu, 40, 400)     # 0..1
-
-            # Channel 3: bone window
-            bone_win = window(hu, 300, 1500)   # 0..1
-
-            # Stack → (Z, H, W, 4)
-            vol = np.stack([raw_hu, lung_win, soft_win, bone_win], axis=-1)
-            vol = resample_volume_3d(vol, TARGET_Z, TARGET_H, TARGET_W)
-
-            # 5. Save
-            out_dir = os.path.join(OUTPUT_ROOT, label)
-            os.makedirs(out_dir, exist_ok=True)
-
-            out_path = os.path.join(out_dir, f"{study}.npy")
-            np.save(out_path, vol.astype(np.float32))
-
+    # Collect results with progress bar
+    for fut in tqdm(as_completed(tasks), total=len(tasks), desc="Processing studies"):
+        out_path, label, study = fut.result()
+        if out_path is not None:
             records.append([out_path, label, study])
 
-        except Exception as e:
-            print(f"[ERROR] {study}: {e}")
-            continue
 
+# Save final index CSV
+df_out = pd.DataFrame(records, columns=["npy_path", "label", "study"])
+df_out.to_csv(os.path.join(OUTPUT_ROOT, "index.csv"), index=False)
 
-# ============================================================
-# SPLIT INTO TRAIN / VAL / TEST
-# ============================================================
-
-df_all = pd.DataFrame(records, columns=["npy_path", "label", "study"])
-df_all = df_all[df_all["npy_path"].apply(os.path.exists)].drop_duplicates(subset=["study"])
-
-print("\n[INFO] Total processed studies:", len(df_all))
-
-# First split into train + temp (val+test)
-train_df, temp_df = train_test_split(
-    df_all,
-    test_size=(1 - TRAIN_RATIO),
-    stratify=df_all["label"],
-    random_state=RANDOM_SEED
-)
-
-# Split temp → val + test
-val_frac = VAL_RATIO / (VAL_RATIO + TEST_RATIO)
-val_df, test_df = train_test_split(
-    temp_df,
-    test_size=(1 - val_frac),
-    stratify=temp_df["label"],
-    random_state=RANDOM_SEED
-)
-
-train_df["split"] = "train"
-val_df["split"] = "val"
-test_df["split"] = "test"
-
-df_split = pd.concat([train_df, val_df, test_df], ignore_index=True)
-
-
-# ============================================================
-# COPY FILES INTO SPLIT FOLDERS
-# ============================================================
-
-def copy_into_split(df, split_name):
-    for _, r in df.iterrows():
-        src = r["npy_path"]
-        label = r["label"]
-        fname = os.path.basename(src)
-
-        dst_dir = os.path.join(OUTPUT_ROOT, split_name, label)
-        os.makedirs(dst_dir, exist_ok=True)
-
-        dst = os.path.join(dst_dir, fname)
-        if not os.path.exists(dst):
-            shutil.copy2(src, dst)
-
-
-copy_into_split(train_df, "train")
-copy_into_split(val_df,   "val")
-copy_into_split(test_df,  "test")
-
-
-# Save final index
-index_path = os.path.join(OUTPUT_ROOT, "index_with_splits.csv")
-df_split.to_csv(index_path, index=False)
-
-print("\n[✓] Split complete!")
-print(df_split["split"].value_counts())
-print(f"Index saved to: {index_path}")
-print(f"Files copied to {OUTPUT_ROOT}/train, val, test/")
+print("\n[✓] Multithreaded preprocessing complete!")
+print("Total studies:", len(df_out))
+print("Index saved to:", os.path.join(OUTPUT_ROOT, "index.csv"))
