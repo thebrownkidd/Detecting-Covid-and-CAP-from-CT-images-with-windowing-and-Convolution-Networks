@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-DataPrep_v3_3_multithread.py
+DataPrep_v3_3_multithread_tightwindows.py
 
 Fast multithreaded preprocessing:
  - Loads DICOM → HU
  - Lung mask
- - CT windows (raw, lung, soft, bone)
- - 4-channel volume
+ - TIGHT CT WINDOWS (raw, lung-tight, soft-tight)
+ - 3-channel volume  (Z,H,W,3)
  - Cubic interpolation (3D)
  - Saves .npy
- - Writes single index CSV (no splits)
+ - Writes index.csv
 
-Uses ThreadPoolExecutor to max out your AMD CPU.
+Uses ThreadPoolExecutor to max out AMD CPU.
 """
 
 import os
@@ -40,7 +40,7 @@ TARGET_Z = 48
 TARGET_H = 64
 TARGET_W = 64
 
-MAX_WORKERS = min(os.cpu_count(), 8)  # Use up to 8 CPU threads
+MAX_WORKERS = min(os.cpu_count(), 8)
 print(f"[i] Using {MAX_WORKERS} threads for preprocessing.")
 
 # --------------------
@@ -48,7 +48,6 @@ print(f"[i] Using {MAX_WORKERS} threads for preprocessing.")
 # --------------------
 
 def load_hu(study_path):
-    """Load DICOM → HU"""
     reader = sitk.ImageSeriesReader()
     dcm_files = reader.GetGDCMSeriesFileNames(study_path)
     if not dcm_files:
@@ -74,6 +73,7 @@ def slice_apply(vol, func):
 
 def lung_mask(hu):
     mask = (hu < -400)
+
     mask = slice_apply(mask, lambda x: opening(x, disk(3)))
     mask = slice_apply(mask, lambda x: closing(x, disk(5)))
 
@@ -96,7 +96,6 @@ def window(hu, level, width):
 
 
 def resample_3d(vol):
-    """3D cubic interpolation to fixed shape"""
     Z, H, W, C = vol.shape
     zoom_factors = (TARGET_Z / Z, TARGET_H / H, TARGET_W / W)
     out = np.zeros((TARGET_Z, TARGET_H, TARGET_W, C), dtype=np.float32)
@@ -104,49 +103,49 @@ def resample_3d(vol):
         out[..., c] = zoom(vol[..., c], zoom_factors, order=3)
     return out
 
-
 # --------------------
-# Worker function
+# Worker
 # --------------------
 
 def process_study(study_path, label, study_name):
-    """
-    Runs full preprocessing for ONE study.
-    Returns: (output_path, label, study_name)
-    """
     try:
-        # Load HU
         hu = load_hu(study_path)
 
-        # Lung segmentation
         mask = lung_mask(hu)
         hu = hu * mask
 
-        # Channels
+        # -------------------------------
+        # **TIGHT WINDOWS**
+        # -------------------------------
+
+        # Raw channel
         raw = np.clip(hu, -1024, 400).astype(np.float32)
         raw = (raw + 1024) / (400 + 1024)
 
-        lung_win = window(hu, -600, 1500)
-        soft_win = window(hu, 40, 400)
-        bone_win = window(hu, 300, 1500)
+        # Lung window (tight)
+        lung_win = window(hu, level=-700, width=1200)  # better for GGO, early COVID
 
-        vol = np.stack([raw, lung_win, soft_win, bone_win], axis=-1)
+        # Soft tissue window (tight)
+        soft_win = window(hu, level=40, width=350)     # better for consolidation boundaries
+
+        # Stack channels  (Z,H,W,3)
+        vol = np.stack([raw, lung_win, soft_win], axis=-1)
+
         vol = resample_3d(vol)
 
-        # Save
         out_dir = os.path.join(OUTPUT_ROOT, label)
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{study_name}.npy")
 
+        out_path = os.path.join(out_dir, f"{study_name}.npy")
         np.save(out_path, vol.astype(np.float32))
+
         return out_path, label, study_name
 
     except Exception as e:
-        return None, None, f"Error in {study_path}: {e}"
-
+        return None, None, f"[ERROR] {study_path}: {e}"
 
 # --------------------
-# Main loop
+# Main multithread loop
 # --------------------
 
 records = []
@@ -169,21 +168,16 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             label = LABEL_MAP[row["Label"]]
             study_path = os.path.join(folder_path, study)
 
-            tasks.append(
-                executor.submit(process_study, study_path, label, study)
-            )
+            tasks.append(executor.submit(process_study, study_path, label, study))
 
-    # Collect results with progress bar
     for fut in tqdm(as_completed(tasks), total=len(tasks), desc="Processing studies"):
         out_path, label, study = fut.result()
         if out_path is not None:
             records.append([out_path, label, study])
 
-
-# Save final index CSV
 df_out = pd.DataFrame(records, columns=["npy_path", "label", "study"])
 df_out.to_csv(os.path.join(OUTPUT_ROOT, "index.csv"), index=False)
 
-print("\n[✓] Multithreaded preprocessing complete!")
+print("\n[✓] Preprocessing complete!")
 print("Total studies:", len(df_out))
 print("Index saved to:", os.path.join(OUTPUT_ROOT, "index.csv"))
