@@ -20,6 +20,20 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.preprocessing import label_binarize
 import tensorflow as tf
+import os
+import warnings
+
+# Hide TF oneDNN and CPU warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0 = all, 1 = INFO, 2 = WARNING, 3 = ERROR
+
+# Suppress Python warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore")
+tf.get_logger().setLevel('ERROR')
+tf.autograph.set_verbosity(0)
 
 SEED = 42
 np.random.seed(SEED)
@@ -91,10 +105,13 @@ def build_tf_dataset(df, label_map, batch, augment=False, shuffle=False):
     output_types = (tf.float32, tf.int32)
     output_shapes = (sample_shape, ())
 
-    ds = tf.data.Dataset.from_generator(gen, output_types=output_types, output_shapes=output_shapes)
-    if shuffle:
-        ds = ds.shuffle(buffer_size=64, seed=SEED)
+    ds = tf.data.Dataset.from_generator(
+    gen,
+    output_types=output_types,
+    output_shapes=output_shapes
+    )
     ds = ds.batch(batch)
+    ds = ds.repeat()     # REQUIRED
     ds = ds.prefetch(AUTOTUNE)
     return ds
 
@@ -125,30 +142,26 @@ def residual_block(x, filters):
 def build_nano3d(input_shape, n_classes):
     inp = tf.keras.Input(shape=input_shape)
 
-    # Block 1 — small but expressive
-    x = conv3d_bn_relu(inp, 16)
-    x = residual_block(x, 16)
-    x = tf.keras.layers.MaxPool3D(2)(x)  # Z/2, H/2, W/2
-
-    # Block 2 — more channels
-    x = conv3d_bn_relu(x, 32)
-    x = residual_block(x, 32)
+    # Block 1: 8 filters only
+    x = tf.keras.layers.Conv3D(8, 3, padding="same", activation='relu')(inp)
     x = tf.keras.layers.MaxPool3D(2)(x)
 
-    # Block 3 — deeper features
-    x = conv3d_bn_relu(x, 48)
-    x = residual_block(x, 48)
+    # Block 2: 12 filters
+    x = tf.keras.layers.Conv3D(12, 3, padding="same", activation='relu')(x)
+    x = tf.keras.layers.MaxPool3D(2)(x)
+
+    # Block 3: 16 filters
+    x = tf.keras.layers.Conv3D(16, 3, padding="same", activation='relu')(x)
     x = tf.keras.layers.GlobalAveragePooling3D()(x)
 
-    # Dense head
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    # Very small dense head
+    x = tf.keras.layers.Dense(32, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.3)(x)
 
     out = tf.keras.layers.Dense(n_classes, activation="softmax")(x)
 
     model = tf.keras.Model(inp, out)
     return model
-
 
 # -------------------------
 # Training + evaluation
@@ -185,7 +198,7 @@ def main(args):
         print("Using class weights:", class_weights)
 
     # build tf datasets
-    train_ds = build_tf_dataset(train_df, label_map, batch=args.batch_size, augment=True, shuffle=True)
+    train_ds = build_tf_dataset(train_df, label_map, batch=args.batch_size, augment=False, shuffle=False)
     val_ds   = build_tf_dataset(val_df,   label_map, batch=args.batch_size, augment=False, shuffle=False)
     test_ds  = build_tf_dataset(test_df,  label_map, batch=args.batch_size, augment=False, shuffle=False)
 
@@ -211,10 +224,15 @@ def main(args):
     tb_cb = tf.keras.callbacks.TensorBoard(log_dir=os.path.join(args.out, "tensorboard"))
     early = tf.keras.callbacks.EarlyStopping(monitor='val_sparse_categorical_accuracy', mode='max', patience=6, restore_best_weights=True)
 
+    steps_per_epoch = len(train_df) // args.batch_size
+    val_steps = len(val_df) // args.batch_size
+
     history = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=val_steps,
         callbacks=[ckpt_cb, tb_cb, early],
         class_weight=class_weights
     )
