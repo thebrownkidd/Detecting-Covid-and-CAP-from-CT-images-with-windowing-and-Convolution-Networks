@@ -4,4 +4,6 @@ Processed/*
 env/
 preprocessed_v2/
 preprocessed/
-runs/
+runs/ 
+preprocessed_v3/
+preprocessed_v3_1/

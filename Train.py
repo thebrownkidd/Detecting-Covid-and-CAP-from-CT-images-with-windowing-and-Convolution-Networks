@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-train_small3d_tf.py
+train_nano3d_v3.py
 
-Ultra-small 3D CNN for training on (Z,H,W,3) preprocessed mask volumes.
-No preprocessing is repeated here — only resize + depth crop/pad.
-
-Default:
-    slices = 48
-    spatial = 48
-    params ~ 70k total
+Train a nano 3D CNN on preprocessed_v3_1 volumes.
+Assumes index CSV has columns: npy_path,label,study,split
 
 Usage:
-    python train_small3d_tf.py --index preprocessed_v2/preprocessed_index.csv --out runs/small_run1
+    python train_nano3d_v3.py --index preprocessed_v3_1/index_with_splits.csv --out runs/nano_v3
 """
 
 import os
@@ -19,261 +14,261 @@ import argparse
 import numpy as np
 import pandas as pd
 import random
+import json
 from tqdm import tqdm
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-import tensorflow as tf
-from skimage.transform import resize
 from sklearn.preprocessing import label_binarize
+import tensorflow as tf
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-DEFAULT_SLICES = 48
-DEFAULT_SPATIAL = 48      # MUCH smaller → faster + less overfit
-DEFAULT_BATCH = 2
-DEFAULT_EPOCHS = 20
 SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+tf.random.set_seed(SEED)
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
-random.seed(SEED)
-
-# -----------------------------
-# Utility Functions
-# -----------------------------
-def crop_or_pad_depth(vol, target_slices):
-    z, h, w, c = vol.shape
-    if z == target_slices:
-        return vol
-    if z > target_slices:
-        start = (z - target_slices) // 2
-        return vol[start:start + target_slices]
-
-    pad = target_slices - z
-    pad_front = pad // 2
-    pad_back  = pad - pad_front
-
-    before = np.repeat(vol[[0]], pad_front, axis=0) if pad_front > 0 else np.zeros((0,h,w,c))
-    after  = np.repeat(vol[[-1]], pad_back, axis=0) if pad_back > 0 else np.zeros((0,h,w,c))
-
-    return np.concatenate([before, vol, after], axis=0)
-
-
-def resize_volume(vol, target_h, target_w):
-    Z,H,W,C = vol.shape
-    out = np.zeros((Z, target_h, target_w, C), dtype=np.float32)
-    for i in range(Z):
-        sl = vol[i].astype(np.float32)
-        out[i] = np.stack([
-            resize(sl[..., ch], (target_h, target_w), order=1, preserve_range=True, anti_aliasing=False)
-            for ch in range(C)
-        ], axis=-1)
-    return out
-
-
-def augment(vol):
-    # VERY LIGHT AUGMENTATION (helps generalization)
-    if random.random() < 0.5:
-        vol = np.flip(vol, axis=2)
-    if random.random() < 0.3:
-        vol = np.flip(vol, axis=1)
-    if random.random() < 0.25:
-        k = random.randint(1,3)
-        vol = np.rot90(vol, k=k, axes=(1,2))
+# -------------------------
+# Data pipeline functions
+# -------------------------
+def npy_loader(path):
+    """Load a .npy volume and ensure dtype float32 and expected shape."""
+    vol = np.load(path)
+    # ensure float32 and clipped to [0,1] (preproc should have done this)
+    vol = vol.astype(np.float32)
+    if vol.max() > 1.5:  # quick sanity check
+        vol = np.clip(vol, 0.0, 1.0)
     return vol
 
-
-# -----------------------------
-# Dataset Pipeline (ONLY resizing + small augment)
-# -----------------------------
-def npy_generator(df, slices, H, W, label_map, augment_flag):
+def generator_from_df(df, label_map, augment=False):
+    """
+    Yields (vol, label_idx).
+    df must contain column 'npy_path' and 'label'
+    """
     for _, row in df.iterrows():
-        path  = row["npy_path"]
-        label = row["label"]
-
         try:
-            vol = np.load(path).astype(np.float32)  # (Z,H,W,3)
-        except:
+            vol = np.load(row['npy_path']).astype(np.float32)  # (Z,H,W,C)
+        except Exception as e:
+            print(f"[WARN] failed loading {row['npy_path']}: {e}")
             continue
 
-        # Resize ONLY
-        vol = crop_or_pad_depth(vol, slices)
-        vol = resize_volume(vol, H, W)
+        # basic sanity: ensure channel last 4D
+        if vol.ndim == 3:
+            vol = vol[..., None]
 
-        # Normalize to [0,1]
-        vol = np.clip(vol, 0, 1)
+        # light augmentation (in numpy)
+        if augment:
+            # flip LR
+            if random.random() < 0.5:
+                vol = np.flip(vol, axis=2)
+            # flip UD
+            if random.random() < 0.3:
+                vol = np.flip(vol, axis=1)
+            # rotate 90 deg occasionally
+            if random.random() < 0.2:
+                k = random.randint(1,3)
+                vol = np.rot90(vol, k=k, axes=(1,2))
 
-        if augment_flag:
-            vol = augment(vol)
-
-        yield vol, np.int32(label_map[label])
+        yield vol, np.int32(label_map[row['label']])
 
 
-def build_dataset(df, batch, slices, H, W, label_map, augment_flag=False, shuffle=False):
-    gen = lambda: npy_generator(df, slices, H, W, label_map, augment_flag)
+def build_tf_dataset(df, label_map, batch, augment=False, shuffle=False):
+    gen = lambda: generator_from_df(df, label_map, augment=augment)
+    # infer shape from first sample
+    for _, r in df.iterrows():
+        try:
+            sample = np.load(r['npy_path'])
+            break
+        except:
+            sample = None
+    if sample is None:
+        raise RuntimeError("No readable .npy found in dataframe.")
+    # shape handling
+    if sample.ndim == 3:
+        sample_shape = (sample.shape[0], sample.shape[1], sample.shape[2], 1)
+    else:
+        sample_shape = (sample.shape[0], sample.shape[1], sample.shape[2], sample.shape[3])
 
-    output_types  = (tf.float32, tf.int32)
-    output_shapes = ((slices, H, W, 3), ())
+    output_types = (tf.float32, tf.int32)
+    output_shapes = (sample_shape, ())
 
-    ds = tf.data.Dataset.from_generator(gen, output_types, output_shapes)
-
+    ds = tf.data.Dataset.from_generator(gen, output_types=output_types, output_shapes=output_shapes)
     if shuffle:
-        ds = ds.shuffle(64, seed=SEED)
-
+        ds = ds.shuffle(buffer_size=64, seed=SEED)
     ds = ds.batch(batch)
     ds = ds.prefetch(AUTOTUNE)
     return ds
 
 
-# -----------------------------
-# ULTRA SMALL 3D CNN
-# (~70k params)
-# -----------------------------
-def build_tiny3d(input_shape, num_classes):
+# -------------------------
+# Nano 3D model (~18k params)
+# -------------------------
+def conv3d_bn_relu(x, filters, kernel=3):
+    x = tf.keras.layers.Conv3D(filters, kernel, padding="same", use_bias=False)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    return tf.keras.layers.ReLU()(x)
+
+def residual_block(x, filters):
+    shortcut = x
+    x = conv3d_bn_relu(x, filters)
+    x = tf.keras.layers.Conv3D(filters, 3, padding="same", use_bias=False)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+
+    # residual add (handles channel mismatch)
+    if shortcut.shape[-1] != filters:
+        shortcut = tf.keras.layers.Conv3D(filters, 1, padding="same", use_bias=False)(shortcut)
+        shortcut = tf.keras.layers.BatchNormalization()(shortcut)
+
+    x = tf.keras.layers.Add()([x, shortcut])
+    x = tf.keras.layers.ReLU()(x)
+    return x
+
+def build_nano3d(input_shape, n_classes):
     inp = tf.keras.Input(shape=input_shape)
 
-    x = tf.keras.layers.Conv3D(16, 3, padding="same", activation="relu")(inp)
+    # Block 1 — small but expressive
+    x = conv3d_bn_relu(inp, 16)
+    x = residual_block(x, 16)
+    x = tf.keras.layers.MaxPool3D(2)(x)  # Z/2, H/2, W/2
+
+    # Block 2 — more channels
+    x = conv3d_bn_relu(x, 32)
+    x = residual_block(x, 32)
     x = tf.keras.layers.MaxPool3D(2)(x)
 
-    x = tf.keras.layers.Conv3D(32, 3, padding="same", activation="relu")(x)
-    x = tf.keras.layers.MaxPool3D(2)(x)
-
-    x = tf.keras.layers.Conv3D(64, 3, padding="same", activation="relu")(x)
+    # Block 3 — deeper features
+    x = conv3d_bn_relu(x, 48)
+    x = residual_block(x, 48)
     x = tf.keras.layers.GlobalAveragePooling3D()(x)
 
+    # Dense head
     x = tf.keras.layers.Dense(64, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.25)(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
 
-    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    out = tf.keras.layers.Dense(n_classes, activation="softmax")(x)
 
-    return tf.keras.Model(inp, out)
+    model = tf.keras.Model(inp, out)
+    return model
 
 
-# -----------------------------
-# Main Train Loop
-# -----------------------------
+# -------------------------
+# Training + evaluation
+# -------------------------
 def main(args):
+    # load index
     df = pd.read_csv(args.index)
+    required_cols = {'npy_path','label','split'}
+    if not required_cols.issubset(set(df.columns)):
+        raise RuntimeError(f"Index CSV must contain columns: {required_cols}")
 
-    train_df = df[df["split"]=="train"].reset_index(drop=True)
-    val_df   = df[df["split"]=="val"].reset_index(drop=True)
-    test_df  = df[df["split"]=="test"].reset_index(drop=True)
+    # remove missing
+    df = df[df['npy_path'].apply(os.path.exists)].reset_index(drop=True)
+    if len(df) == 0:
+        raise RuntimeError("No .npy files found per index.")
 
-    print(f"train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
-
-    labels = sorted(df["label"].unique().tolist())
-    label_map = {lab: i for i, lab in enumerate(labels)}
+    # build label map consistent across splits
+    labels_sorted = sorted(df['label'].unique().tolist())
+    label_map = {lab:i for i,lab in enumerate(labels_sorted)}
+    print("Labels:", labels_sorted)
     print("Label map:", label_map)
 
-    train_ds = build_dataset(train_df, args.batch_size, args.slices, args.spatial, args.spatial,
-                             label_map, augment_flag=True, shuffle=True)
-    val_ds   = build_dataset(val_df, args.batch_size, args.slices, args.spatial, args.spatial,
-                             label_map, augment_flag=False, shuffle=False)
-    test_ds  = build_dataset(test_df, args.batch_size, args.slices, args.spatial, args.spatial,
-                             label_map, augment_flag=False, shuffle=False)
+    train_df = df[df['split']=='train'].reset_index(drop=True)
+    val_df   = df[df['split']=='val'].reset_index(drop=True)
+    test_df  = df[df['split']=='test'].reset_index(drop=True)
+    print(f"Samples: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
 
-    num_classes = len(labels)
-    input_shape = (args.slices, args.spatial, args.spatial, 3)
+    # compute class weights from train only
+    class_weights = None
+    if args.use_class_weights:
+        y = train_df['label'].map(label_map).values
+        cw = compute_class_weight(class_weight='balanced', classes=np.arange(len(labels_sorted)), y=y)
+        class_weights = {i: float(w) for i,w in enumerate(cw)}
+        print("Using class weights:", class_weights)
 
-    model = build_tiny3d(input_shape, num_classes)
+    # build tf datasets
+    train_ds = build_tf_dataset(train_df, label_map, batch=args.batch_size, augment=True, shuffle=True)
+    val_ds   = build_tf_dataset(val_df,   label_map, batch=args.batch_size, augment=False, shuffle=False)
+    test_ds  = build_tf_dataset(test_df,  label_map, batch=args.batch_size, augment=False, shuffle=False)
+
+    # infer input shape from dataset element
+    for xb, yb in train_ds.take(1):
+        input_shape = xb.shape[1:]  # (Z,H,W,C)
+        break
+
+    model = build_nano3d(input_shape, n_classes=len(labels_sorted))
     model.summary()
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(args.lr),
-        loss="sparse_categorical_crossentropy",
-        metrics=["sparse_categorical_accuracy"]
+        loss='sparse_categorical_crossentropy',
+        metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name='sparse_categorical_accuracy')]
     )
 
     os.makedirs(args.out, exist_ok=True)
-
     ckpt_path = os.path.join(args.out, "best_model.h5")
-    ckpt = tf.keras.callbacks.ModelCheckpoint(
-        ckpt_path,
-        monitor="val_sparse_categorical_accuracy",
-        save_best_only=True,
-        mode="max",
-        verbose=1
+    ckpt_cb = tf.keras.callbacks.ModelCheckpoint(
+        ckpt_path, monitor='val_sparse_categorical_accuracy', save_best_only=True, mode='max', verbose=1
     )
+    tb_cb = tf.keras.callbacks.TensorBoard(log_dir=os.path.join(args.out, "tensorboard"))
+    early = tf.keras.callbacks.EarlyStopping(monitor='val_sparse_categorical_accuracy', mode='max', patience=6, restore_best_weights=True)
 
-    early = tf.keras.callbacks.EarlyStopping(
-        monitor="val_sparse_categorical_accuracy",
-        patience=5,
-        mode="max",
-        restore_best_weights=True
-    )
-
-    tb = tf.keras.callbacks.TensorBoard(log_dir=os.path.join(args.out, "tensorboard"))
-
-    # TRAIN
     history = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=args.epochs,
-        callbacks=[ckpt, early, tb]
+        callbacks=[ckpt_cb, tb_cb, early],
+        class_weight=class_weights
     )
 
+    # save final model & history
     final_path = os.path.join(args.out, "final_model.h5")
     model.save(final_path)
+    with open(os.path.join(args.out, "history.json"), "w") as fh:
+        json.dump(history.history, fh, indent=2)
     print("Saved final model to:", final_path)
 
-    # -------------------------
-    # Evaluate on Test
-    # -------------------------
+    # ---- Evaluate on test ----
     y_true = []
     y_prob = []
-
-    for xb, yb in tqdm(test_ds, desc="Testing"):
-        pred = model.predict(xb)
-        y_prob.extend(pred.tolist())
+    for xb, yb in tqdm(test_ds, desc="Predicting test"):
+        p = model.predict(xb)
+        y_prob.extend(p.tolist())
         y_true.extend(yb.numpy().tolist())
 
     y_true = np.array(y_true)
     y_prob = np.array(y_prob)
     y_pred = np.argmax(y_prob, axis=1)
 
-    print("\nClassification Report:")
-    print(classification_report(y_true, y_pred, target_names=labels))
-
-    print("Confusion Matrix:")
+    print("\nClassification report:")
+    print(classification_report(y_true, y_pred, target_names=labels_sorted, digits=4))
+    print("\nConfusion matrix:")
     print(confusion_matrix(y_true, y_pred))
 
-    # Per-class AUC
+    # per-class AUC
     try:
-        y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+        y_true_bin = label_binarize(y_true, classes=list(range(len(labels_sorted))))
         aucs = {}
-        for i, lab in enumerate(labels):
+        for i, lab in enumerate(labels_sorted):
             try:
-                auc_val = roc_auc_score(y_true_bin[:, i], y_prob[:, i])
+                aucs[lab] = float(roc_auc_score(y_true_bin[:, i], y_prob[:, i]))
             except:
-                auc_val = float("nan")
-            aucs[lab] = auc_val
-        print("\nPer-class AUC:", aucs)
-    except:
-        print("AUC computation skipped.")
+                aucs[lab] = float('nan')
+        print("\nPer-class AUCs:", aucs)
+    except Exception as e:
+        print("AUC computation skipped:", e)
 
-    # Save history
-    import json
-    with open(os.path.join(args.out, "history.json"), "w") as f:
-        json.dump(history.history, f, indent=2)
-
-    print("\nDONE. Run outputs saved to:", args.out)
+    print("\nRun saved to:", args.out)
 
 
-# -----------------------------
+# -------------------------
 # CLI
-# -----------------------------
+# -------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--index", required=True)
-    parser.add_argument("--out", default="runs/small_run1")
-    parser.add_argument("--slices", type=int, default=DEFAULT_SLICES)
-    parser.add_argument("--spatial", type=int, default=DEFAULT_SPATIAL)
-    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    args = parser.parse_args()
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--index", required=True, help="Path to index_with_splits.csv")
+    p.add_argument("--out", default="runs/nano_v3", help="Output folder")
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--use_class_weights", action="store_true", help="Compute and use class weights from train set")
+    args = p.parse_args()
     main(args)
-
-
