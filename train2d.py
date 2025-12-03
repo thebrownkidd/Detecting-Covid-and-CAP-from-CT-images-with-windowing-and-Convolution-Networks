@@ -164,32 +164,49 @@ class LearnableWindow(nn.Module):
 # ------------------------
 # Tiny 2D CNN (per-slice)
 # ------------------------
+import torch
+import torch.nn as nn
+
 class TinySliceCNN(nn.Module):
-    def __init__(self, in_channels=4, n_classes=3, embedding_dim=16):
+    def __init__(self, in_channels=4, n_classes=3, embedding_dim=64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 8, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(8),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
 
-            nn.Conv2d(8, 12, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(12),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+        def conv_block(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True)
+            )
 
-            nn.Conv2d(12, 16, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),  # (B,16,1,1)
-            nn.Flatten(),             # (B,16)
-            nn.Linear(16, embedding_dim),
-            nn.ReLU()
+        self.features = nn.Sequential(
+            conv_block(in_channels, 32),
+            nn.MaxPool2d(2),   # 64→32
+
+            conv_block(32, 64),
+            nn.MaxPool2d(2),   # 32→16
+
+            conv_block(64, 128),
+            nn.MaxPool2d(2),   # 16→8
+
+            conv_block(128, 256),
+            nn.AdaptiveAvgPool2d(1)  # (B,256,1,1)
         )
+
+        self.embedding = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2)
+        )
+
         self.classifier = nn.Linear(embedding_dim, n_classes)
 
     def forward(self, x):
-        feat = self.net(x)            # (B, D)
+        feat = self.features(x)      # (B,256,1,1)
+        feat = self.embedding(feat)  # (B,embedding_dim)
         logits = self.classifier(feat)
         return logits, feat
 
